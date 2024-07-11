@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:generate mockgen -destination franz_mock.go -package source -mock_names=Client=MockClient . Client
+
 package source
 
 import (
@@ -19,32 +21,51 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	sdk "github.com/conduitio/conduit-connector-sdk"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 type FranzConsumer struct {
-	client *kgo.Client
+	client Client
 	acker  *batchAcker
 
 	iter *kgo.FetchesRecordIter
 }
 
+// Client is a franz-go kafka client.
+type Client interface {
+	Close()
+	CommitRecords(ctx context.Context, rs ...*kgo.Record) error
+	OptValue(opt any) any
+	PollFetches(ctx context.Context) kgo.Fetches
+	AllowRebalance()
+}
+
 var _ Consumer = (*FranzConsumer)(nil)
 
 func NewFranzConsumer(ctx context.Context, cfg Config) (*FranzConsumer, error) {
+	c := &FranzConsumer{
+		iter: &kgo.FetchesRecordIter{}, // empty iterator is done
+	}
+
 	opts := cfg.FranzClientOpts(sdk.Logger(ctx))
 	opts = append(opts, []kgo.Opt{
 		kgo.ConsumerGroup(cfg.GroupID),
 		kgo.ConsumeTopics(cfg.Topics...),
+		kgo.BlockRebalanceOnPoll(),
 	}...)
 
 	if !cfg.ReadFromBeginning {
 		opts = append(opts, kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()))
 	}
 	if cfg.GroupID != "" {
-		opts = append(opts, kgo.DisableAutoCommit()) // TODO research if we need to add OnPartitionsRevoked (see DisableAutoCommit doc)
+		opts = append(opts, []kgo.Opt{
+			kgo.DisableAutoCommit(),
+			kgo.OnPartitionsRevoked(c.lost),
+			kgo.OnPartitionsLost(c.lost),
+		}...)
 	}
 
 	cl, err := kgo.NewClient(opts...)
@@ -52,11 +73,18 @@ func NewFranzConsumer(ctx context.Context, cfg Config) (*FranzConsumer, error) {
 		return nil, fmt.Errorf("failed to create kafka client: %w", err)
 	}
 
-	return &FranzConsumer{
-		client: cl,
-		acker:  newBatchAcker(cl, 1000),
-		iter:   &kgo.FetchesRecordIter{}, // empty iterator is done
-	}, nil
+	c.client = cl
+	c.acker = newBatchAcker(cl, 1000)
+
+	return c, nil
+}
+
+func (c *FranzConsumer) lost(ctx context.Context, cl *kgo.Client, lost map[string][]int32) {
+	// TODO: put a proper retry backoff loop here.
+	for c.acker.curBatchIndex != 0 {
+		sdk.Logger(ctx).Warn().Msgf("partitions revoked or lost, waiting until current batch of records are acked and committed...")
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func (c *FranzConsumer) Consume(ctx context.Context) (*Record, error) {
@@ -72,6 +100,7 @@ func (c *FranzConsumer) Consume(ctx context.Context) (*Record, error) {
 		c.acker.Records(fetches.Records()...)
 		break
 	}
+	c.client.AllowRebalance()
 	return (*Record)(c.iter.Next()), nil
 }
 
@@ -92,7 +121,7 @@ func (c *FranzConsumer) Close(ctx context.Context) error {
 
 // batchAcker commits acks in batches.
 type batchAcker struct {
-	client *kgo.Client
+	client Client
 
 	batchSize     int
 	curBatchIndex int
@@ -101,7 +130,7 @@ type batchAcker struct {
 	m       sync.Mutex
 }
 
-func newBatchAcker(client *kgo.Client, batchSize int) *batchAcker {
+func newBatchAcker(client Client, batchSize int) *batchAcker {
 	return &batchAcker{
 		client:        client,
 		batchSize:     batchSize,
@@ -122,6 +151,7 @@ func (a *batchAcker) Ack(ctx context.Context) error {
 		return nil
 	}
 	// TODO flush on timeout
+	sdk.Logger(ctx).Debug().Msgf("acked on batch index: %d", a.curBatchIndex)
 	return a.Flush(ctx)
 }
 
@@ -133,6 +163,7 @@ func (a *batchAcker) Flush(ctx context.Context) error {
 	a.m.Lock()
 	defer a.m.Unlock()
 
+	sdk.Logger(ctx).Debug().Msgf("flushing from beginning to batch index %d.", a.curBatchIndex)
 	err := a.client.CommitRecords(ctx, a.records[:a.curBatchIndex]...)
 	if err != nil {
 		return fmt.Errorf("failed to commit records: %w", err)
